@@ -62,7 +62,6 @@ func (c *DigestClient) Do(req *http.Request) (*http.Response, error) {
 		authHeader := resp.Header.Get("WWW-Authenticate")
 		if strings.HasPrefix(authHeader, "Digest ") {
 			auth := parseAuthDetails(authHeader)
-
 			// Reset the body for retry
 			if bodyBytes != nil {
 				req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -109,24 +108,23 @@ func parseAuthDetails(header string) authDetails {
 
 // createAuthHeader generates the Authorization header for Digest Authentication.
 func (c *DigestClient) createAuthHeader(req *http.Request, auth authDetails) string {
-	ha1 := md5Hash(fmt.Sprintf("%s:%s:%s", c.username, auth.realm, c.password))
-	ha2 := md5Hash(fmt.Sprintf("%s:%s", req.Method, req.URL.Path))
-	nonceCount := "00000001"
+	ha1 := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", c.username, auth.realm, c.password))))
+	ha2 := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s", req.Method, req.URL.String()))))
+	nc := "00000001"
 	cnonce := generateCNonce()
 
 	response := md5Hash(fmt.Sprintf("%s:%s:%s:%s:%s:%s",
-		ha1, auth.nonce, nonceCount, cnonce, auth.qop, ha2))
+		ha1, auth.nonce, nc, cnonce, auth.qop, ha2))
 
 	authHeader := fmt.Sprintf(
-		`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", opaque="%s", qop=%s, nc=%s, cnonce="%s"`,
+		`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", qop=%s, nc=%s, cnonce="%s"`,
 		c.username,
 		auth.realm,
 		auth.nonce,
-		req.URL.Path,
+		req.URL.String(),
 		response,
-		auth.opaque,
 		auth.qop,
-		nonceCount,
+		nc,
 		cnonce,
 	)
 
