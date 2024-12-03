@@ -4,6 +4,8 @@ package digest
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,7 +53,6 @@ func (c *DigestClient) Do(req *http.Request) (*http.Response, error) {
 		req.Body = io.NopCloser(bytes.NewReader(bodyBytes)) // Reset body for the first request
 	}
 
-	// First attempt
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -68,7 +69,7 @@ func (c *DigestClient) Do(req *http.Request) (*http.Response, error) {
 			}
 
 			req.Header.Set("Authorization", c.createAuthHeader(req, auth))
-			return c.client.Do(req) // Retry
+			return c.client.Do(req)
 		}
 	}
 	return resp, nil
@@ -106,18 +107,22 @@ func parseAuthDetails(header string) authDetails {
 	return auth
 }
 
-// createAuthHeader generates the Authorization header for Digest Authentication.
+// createAuthHeader generates the Authorization header for Digest Authentication,
+// supporting multiple algorithms.
 func (c *DigestClient) createAuthHeader(req *http.Request, auth authDetails) string {
-	ha1 := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", c.username, auth.realm, c.password))))
-	ha2 := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s", req.Method, req.URL.String()))))
 	nc := "00000001"
 	cnonce := generateCNonce()
 
-	response := md5Hash(fmt.Sprintf("%s:%s:%s:%s:%s:%s",
-		ha1, auth.nonce, nc, cnonce, auth.qop, ha2))
+	// Compute HA1 and HA2
+	ha1 := computeHA1(c.username, c.password, auth, cnonce)
+	ha2 := computeHA2(req.Method, req.URL.String(), auth)
 
-	authHeader := fmt.Sprintf(
-		`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", qop=%s, nc=%s, cnonce="%s"`,
+	// Compute response hash
+	response := computeResponseHash(ha1, ha2, auth, nc, cnonce)
+
+	// Build Authorization header
+	return fmt.Sprintf(
+		`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", qop=%s, nc=%s, cnonce="%s", algorithm="%s"`,
 		c.username,
 		auth.realm,
 		auth.nonce,
@@ -126,19 +131,64 @@ func (c *DigestClient) createAuthHeader(req *http.Request, auth authDetails) str
 		auth.qop,
 		nc,
 		cnonce,
+		auth.algorithm,
 	)
-
-	return authHeader
 }
 
-// generateCNonce generates a client nonce for the request.
-func generateCNonce() string {
-	return fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))
+// computeHA1 calculates HA1 based on the authentication algorithm.
+func computeHA1(username, password string, auth authDetails, cnonce string) string {
+	switch strings.ToLower(auth.algorithm) {
+	case "md5", "":
+		return md5Hash(fmt.Sprintf("%s:%s:%s", username, auth.realm, password))
+	case "md5-sess":
+		initialHA1 := md5Hash(fmt.Sprintf("%s:%s:%s", username, auth.realm, password))
+		return md5Hash(fmt.Sprintf("%s:%s:%s", initialHA1, auth.nonce, cnonce))
+	case "sha-256":
+		return sha256Hash(fmt.Sprintf("%s:%s:%s", username, auth.realm, password))
+	case "sha-256-sess":
+		initialHA1 := sha256Hash(fmt.Sprintf("%s:%s:%s", username, auth.realm, password))
+		return sha256Hash(fmt.Sprintf("%s:%s:%s", initialHA1, auth.nonce, cnonce))
+	default:
+		panic(fmt.Sprintf("unsupported digest algorithm: %s", auth.algorithm))
+	}
+}
+
+// computeHA2 calculates HA2 based on the request method and URI.
+func computeHA2(method, uri string, auth authDetails) string {
+	switch strings.ToLower(auth.algorithm) {
+	case "sha-256", "sha-256-sess":
+		return sha256Hash(fmt.Sprintf("%s:%s", method, uri))
+	default: // Default to MD5
+		return md5Hash(fmt.Sprintf("%s:%s", method, uri))
+	}
+}
+
+// computeResponseHash calculates the response hash for the digest authentication header.
+func computeResponseHash(ha1, ha2 string, auth authDetails, nc, cnonce string) string {
+	data := fmt.Sprintf("%s:%s:%s:%s:%s:%s", ha1, auth.nonce, nc, cnonce, auth.qop, ha2)
+	switch strings.ToLower(auth.algorithm) {
+	case "sha-256", "sha-256-sess":
+		return sha256Hash(data)
+	default:
+		return md5Hash(data)
+	}
 }
 
 // md5Hash calculates the MD5 hash of a string.
 func md5Hash(data string) string {
 	hash := md5.New()
 	_, _ = io.WriteString(hash, data)
-	return fmt.Sprintf("%x", hash.Sum(nil))
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// sha256Hash calculates the SHA-256 hash of a string.
+func sha256Hash(data string) string {
+	hash := sha256.New()
+	_, _ = io.WriteString(hash, data)
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// generateCNonce generates a client nonce for the request.
+func generateCNonce() string {
+	return md5Hash(fmt.Sprintf("%d", time.Now().UnixNano()))
 }
