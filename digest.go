@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// authDetails holds the details of the Digest Authentication challenge.
+// authDetails holds the parameters parsed from a WWW-Authenticate header.
 type authDetails struct {
 	realm     string
 	nonce     string
@@ -22,7 +22,7 @@ type authDetails struct {
 	algorithm string
 }
 
-// DigestClient is used to make Digest Authenticated HTTP requests.
+// DigestClient is used to make HTTP requests with Digest Authentication.
 type DigestClient struct {
 	username string
 	password string
@@ -38,19 +38,23 @@ func NewDigestClient(username, password string, client *http.Client) *DigestClie
 	}
 }
 
-// Do performs an HTTP request using Digest Authentication.
-// If the request is unauthenticated (401), it retries with the Authorization header.
+// Do performs an HTTP request using Digest Authentication. If the first attempt
+// returns a 401 Unauthorized and the response includes a Digest challenge, the request
+// is retried with an appropriate Authorization header.
+// Note: the original request is modified in-place.
 func (c *DigestClient) Do(req *http.Request) (*http.Response, error) {
-	var bodyBytes []byte
+	var savedBody []byte
 	var err error
 
-	// Save the original body if present
-	if req.Body != nil {
-		bodyBytes, err = io.ReadAll(req.Body)
+	// If a body is present and GetBody is not provided, read and buffer it.
+	// (If GetBody is provided, it will be used to reset the body on retry.)
+	if req.Body != nil && req.GetBody == nil {
+		savedBody, err = io.ReadAll(req.Body)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read request body: %v", err)
+			return nil, fmt.Errorf("failed to read request body: %w", err)
 		}
-		req.Body = io.NopCloser(bytes.NewReader(bodyBytes)) // Reset body for the first request
+		// Reset the body for the first request.
+		req.Body = io.NopCloser(bytes.NewReader(savedBody))
 	}
 
 	resp, err := c.client.Do(req)
@@ -58,17 +62,32 @@ func (c *DigestClient) Do(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	// If unauthorized, retry with Digest Authentication
+	// If unauthorized, check for a Digest challenge and retry.
 	if resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+
 		authHeader := resp.Header.Get("WWW-Authenticate")
 		if strings.HasPrefix(authHeader, "Digest ") {
 			auth := parseAuthDetails(authHeader)
-			// Reset the body for retry
-			if bodyBytes != nil {
-				req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+			// Reset the body for the retry.
+			if req.Body != nil {
+				if req.GetBody != nil {
+					var err error
+					req.Body, err = req.GetBody()
+					if err != nil {
+						return nil, fmt.Errorf("failed to reset request body: %w", err)
+					}
+				} else {
+					req.Body = io.NopCloser(bytes.NewReader(savedBody))
+				}
 			}
 
-			req.Header.Set("Authorization", c.createAuthHeader(req, auth))
+			authValue, err := c.createAuthHeader(req, auth)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Authorization", authValue)
 			return c.client.Do(req)
 		}
 	}
@@ -80,11 +99,16 @@ func (c *DigestClient) DoNoAuth(req *http.Request) (*http.Response, error) {
 	return c.client.Do(req)
 }
 
-// parseAuthDetails extracts the details from a Digest Authentication header.
+// parseAuthDetails extracts the digest authentication parameters from a challenge header.
 func parseAuthDetails(header string) authDetails {
 	auth := authDetails{}
-	fields := strings.Split(header[len("Digest "):], ", ")
+	trimmed := strings.TrimPrefix(header, "Digest ")
+	fields := strings.Split(trimmed, ",")
 	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
 		parts := strings.SplitN(field, "=", 2)
 		if len(parts) != 2 {
 			continue
@@ -107,49 +131,53 @@ func parseAuthDetails(header string) authDetails {
 	return auth
 }
 
-// createAuthHeader generates the Authorization header for Digest Authentication,
-// supporting multiple algorithms.
-func (c *DigestClient) createAuthHeader(req *http.Request, auth authDetails) string {
+// createAuthHeader generates the Digest Authorization header for the given request and auth details.
+func (c *DigestClient) createAuthHeader(req *http.Request, auth authDetails) (string, error) {
+	// Use a fixed nonce count ("nc") value.
 	nc := "00000001"
 	cnonce := generateCNonce()
 
-	// Compute HA1 and HA2
-	ha1 := computeHA1(c.username, c.password, auth, cnonce)
-	ha2 := computeHA2(req.Method, req.URL.String(), auth)
-
-	// Compute response hash
+	ha1, err := computeHA1(c.username, c.password, auth, cnonce)
+	if err != nil {
+		return "", err
+	}
+	// Use RequestURI (path + query) per the spec.
+	ha2 := computeHA2(req.Method, req.URL.RequestURI(), auth)
 	response := computeResponseHash(ha1, ha2, auth, nc, cnonce)
 
-	// Build Authorization header
-	return fmt.Sprintf(
+	header := fmt.Sprintf(
 		`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", qop=%s, nc=%s, cnonce="%s", algorithm="%s"`,
 		c.username,
 		auth.realm,
 		auth.nonce,
-		req.URL.String(),
+		req.URL.RequestURI(),
 		response,
 		auth.qop,
 		nc,
 		cnonce,
 		auth.algorithm,
 	)
+	if auth.opaque != "" {
+		header += fmt.Sprintf(`, opaque="%s"`, auth.opaque)
+	}
+	return header, nil
 }
 
-// computeHA1 calculates HA1 based on the authentication algorithm.
-func computeHA1(username, password string, auth authDetails, cnonce string) string {
+// computeHA1 calculates HA1 according to the algorithm specified in the challenge.
+func computeHA1(username, password string, auth authDetails, cnonce string) (string, error) {
 	switch strings.ToLower(auth.algorithm) {
-	case "md5", "":
-		return md5Hash(fmt.Sprintf("%s:%s:%s", username, auth.realm, password))
+	case "", "md5":
+		return md5Hash(fmt.Sprintf("%s:%s:%s", username, auth.realm, password)), nil
 	case "md5-sess":
-		initialHA1 := md5Hash(fmt.Sprintf("%s:%s:%s", username, auth.realm, password))
-		return md5Hash(fmt.Sprintf("%s:%s:%s", initialHA1, auth.nonce, cnonce))
+		initial := md5Hash(fmt.Sprintf("%s:%s:%s", username, auth.realm, password))
+		return md5Hash(fmt.Sprintf("%s:%s:%s", initial, auth.nonce, cnonce)), nil
 	case "sha-256":
-		return sha256Hash(fmt.Sprintf("%s:%s:%s", username, auth.realm, password))
+		return sha256Hash(fmt.Sprintf("%s:%s:%s", username, auth.realm, password)), nil
 	case "sha-256-sess":
-		initialHA1 := sha256Hash(fmt.Sprintf("%s:%s:%s", username, auth.realm, password))
-		return sha256Hash(fmt.Sprintf("%s:%s:%s", initialHA1, auth.nonce, cnonce))
+		initial := sha256Hash(fmt.Sprintf("%s:%s:%s", username, auth.realm, password))
+		return sha256Hash(fmt.Sprintf("%s:%s:%s", initial, auth.nonce, cnonce)), nil
 	default:
-		panic(fmt.Sprintf("unsupported digest algorithm: %s", auth.algorithm))
+		return "", fmt.Errorf("unsupported digest algorithm: %s", auth.algorithm)
 	}
 }
 
@@ -163,7 +191,7 @@ func computeHA2(method, uri string, auth authDetails) string {
 	}
 }
 
-// computeResponseHash calculates the response hash for the digest authentication header.
+// computeResponseHash calculates the digest response hash.
 func computeResponseHash(ha1, ha2 string, auth authDetails, nc, cnonce string) string {
 	data := fmt.Sprintf("%s:%s:%s:%s:%s:%s", ha1, auth.nonce, nc, cnonce, auth.qop, ha2)
 	switch strings.ToLower(auth.algorithm) {
@@ -174,21 +202,21 @@ func computeResponseHash(ha1, ha2 string, auth authDetails, nc, cnonce string) s
 	}
 }
 
-// md5Hash calculates the MD5 hash of a string.
+// md5Hash returns the MD5 hash of the given string.
 func md5Hash(data string) string {
 	hash := md5.New()
 	_, _ = io.WriteString(hash, data)
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
-// sha256Hash calculates the SHA-256 hash of a string.
+// sha256Hash returns the SHA-256 hash of the given string.
 func sha256Hash(data string) string {
 	hash := sha256.New()
 	_, _ = io.WriteString(hash, data)
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
-// generateCNonce generates a client nonce for the request.
+// generateCNonce generates a client nonce based on the current time.
 func generateCNonce() string {
 	return md5Hash(fmt.Sprintf("%d", time.Now().UnixNano()))
 }
